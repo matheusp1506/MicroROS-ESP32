@@ -52,73 +52,46 @@ static EventGroupHandle_t wifi_event_group;
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){ ESP_LOGE(TAG, "Failed status on line %d: %d. Aborting.", __LINE__, (int)temp_rc); vTaskDelete(NULL); }}
 #define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){ ESP_LOGW(TAG, "Soft check failed on line %d: %d.", __LINE__, (int)temp_rc); }}
 
-#include "lwip/netdb.h"
 
-// Satisfy libmicroros.a symbols by routing directly to lwIP's POSIX functions
-int lwip_getaddrinfo(const char *nodename, const char *servname,
-                     const struct addrinfo *hints, struct addrinfo **res) {
-    return getaddrinfo(nodename, servname, hints, res);
-}
-
-void lwip_freeaddrinfo(struct addrinfo *ai) {
-    freeaddrinfo(ai);
-}
-
-/* =========================================================================
- * Custom POSIX UDP Transport for micro-ROS
- * ========================================================================= */
-typedef struct {
-    struct sockaddr_in agent_addr;
-    int sock;
-} custom_transport_args_t;
-
-static bool custom_transport_open(struct uxrCustomTransport *transport) {
-    custom_transport_args_t *args = (custom_transport_args_t *)transport->args;
-    args->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    return args->sock >= 0;
-}
-
-static bool custom_transport_close(struct uxrCustomTransport *transport) {
-    custom_transport_args_t *args = (custom_transport_args_t *)transport->args;
-    if (args->sock >= 0) {
-        close(args->sock);
-        args->sock = -1;
-    }
-    return true;
-}
-
-static size_t custom_transport_write(struct uxrCustomTransport *transport, const uint8_t *buf, size_t len, uint8_t *err) {
-    custom_transport_args_t *args = (custom_transport_args_t *)transport->args;
-    ssize_t sent = sendto(args->sock, buf, len, 0, (struct sockaddr *)&args->agent_addr, sizeof(args->agent_addr));
-    *err = (sent < 0) ? 1 : 0;
-    return (sent >= 0) ? (size_t)sent : 0;
-}
-
-static size_t custom_transport_read(struct uxrCustomTransport *transport, uint8_t *buf, size_t len, int timeout_ms, uint8_t *err) {
-    custom_transport_args_t *args = (custom_transport_args_t *)transport->args;
-    struct timeval tv = {
-        .tv_sec = timeout_ms / 1000,
-        .tv_usec = (timeout_ms % 1000) * 1000
-    };
-    setsockopt(args->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    ssize_t received = recv(args->sock, buf, len, 0);
-    *err = (received < 0) ? 1 : 0;
-    return (received >= 0) ? (size_t)received : 0;
-}
 
 /* =========================================================================
  * Standard ESP-IDF Wi-Fi Initialization
  * ========================================================================= */
+#include "esp_timer.h"
+
+static esp_timer_handle_t wifi_retry_timer = NULL;
+
+static void wifi_retry_timer_cb(void* arg) {
+    ESP_LOGI(TAG, "Retrying Wi-Fi connection...");
+    esp_wifi_connect();
+}
+
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "Wi-Fi station started, attempting connection to '%s'...", CONFIG_ESP_WIFI_SSID);
         esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "Wi-Fi associated with AP. Awaiting DHCP IP lease...");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "Wi-Fi disconnected. Reconnecting...");
-        esp_wifi_connect();
+        wifi_event_sta_disconnected_t* disconn = (wifi_event_sta_disconnected_t*) event_data;
+        ESP_LOGW(TAG, "Wi-Fi disconnected (reason %d). Reconnecting in 2s...", disconn->reason);
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+
+        if (!wifi_retry_timer) {
+            const esp_timer_create_args_t timer_args = {
+                .callback = &wifi_retry_timer_cb,
+                .name = "wifi_retry"
+            };
+            esp_timer_create(&timer_args, &wifi_retry_timer);
+        }
+        esp_timer_stop(wifi_retry_timer);
+        esp_timer_start_once(wifi_retry_timer, 2000000); // 2 seconds delay
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Connected to AP. IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "Connected to AP! Assigned IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        if (wifi_retry_timer) {
+            esp_timer_stop(wifi_retry_timer);
+        }
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -142,13 +115,24 @@ static void wifi_init_sta(void) {
             .ssid = CONFIG_ESP_WIFI_SSID,
             .password = CONFIG_ESP_WIFI_PASSWORD,
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .capable = false,
+                .required = false
+            },
         },
     };
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Waiting for Wi-Fi connection...");
+    // Force 20MHz channel bandwidth for maximum reliability on 2.4GHz
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+
+    // Disable Wi-Fi modem sleep/power saving to ensure robust DHCP negotiation and packet handling
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+    ESP_LOGI(TAG, "Waiting for Wi-Fi connection and IP lease...");
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
 }
 
