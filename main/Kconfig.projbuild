@@ -1,0 +1,27 @@
+menu "Micro-ROS & Wi-Fi Configuration"
+
+    config ESP_WIFI_SSID
+        string "WiFi SSID"
+        default "myssid"
+        help
+            SSID (network name) to connect to.
+
+    config ESP_WIFI_PASSWORD
+        string "WiFi Password"
+        default "mypassword"
+        help
+            WiFi password (WPA or WPA2) to use.
+
+    config MICRO_ROS_AGENT_IP
+        string "Micro-ROS Agent IP"
+        default "192.168.1.100"
+        help
+            IP address of the micro-ROS agent.
+
+    config MICRO_ROS_AGENT_PORT
+        string "Micro-ROS Agent Port"
+        default "8888"
+        help
+            Port of the micro-ROS agent.
+
+endmenu
