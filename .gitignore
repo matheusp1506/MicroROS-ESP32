@@ -21,6 +21,7 @@
 build/
 *.o
 *.a
+!components/**/*.a
 *.out
 *.exe # For any host-side utilities compiled on Windows
 
